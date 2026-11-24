@@ -57,14 +57,75 @@ from plane.bgtasks.recent_visited_task import recent_visited_task
 from plane.bgtasks.copy_s3_object import copy_s3_objects_of_description_and_assets
 from plane.app.permissions import ProjectPagePermission
 
+# Maximum number of ancestors a page may have (depth of the tree). A child of a
+# root has 1 ancestor; the limit bounds recursive operations (archive CTE,
+# ancestor walks) and keeps the tree readable in the UI.
+MAX_PAGE_DEPTH = 5
+
+
+class ParentValidationError(Exception):
+    """Raised when a parent choice is invalid (self-parent, cycle,
+    cross-project parent or nesting beyond MAX_PAGE_DEPTH)."""
+
+
+def _count_ancestors(page):
+    """Number of ancestors of a page. Walks parent links with a visited set so
+    a (corrupted) cyclic graph cannot loop forever."""
+    count, seen, node = 0, set(), page
+    while node.parent_id is not None and node.parent_id not in seen:
+        seen.add(node.parent_id)
+        count += 1
+        node = node.parent
+    return count
+
+
+def _subtree_height(page_id):
+    """Maximum distance from page_id to its farthest descendant."""
+    max_height, stack, seen = 0, [(page_id, 0)], set()
+    while stack:
+        pid, depth = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        max_height = max(max_height, depth)
+        child_ids = Page.objects.filter(parent_id=pid).values_list("id", flat=True)
+        stack.extend((cid, depth + 1) for cid in child_ids)
+    return max_height
+
+
+def _validate_parent_choice(parent, page, project_id):
+    """Shared parent validation for create (page=None) and partial_update.
+
+    Raises ParentValidationError (self-parent, cycle, depth) or
+    Page.DoesNotExist (unknown or cross-project parent).
+    """
+    if page is not None and parent.pk == page.pk:
+        raise ParentValidationError("A page cannot be its own parent")
+
+    if page is not None:
+        # Cycle: walking the new parent's ancestors must never reach the page.
+        seen, node = set(), parent
+        while node.parent_id is not None and node.parent_id not in seen:
+            if node.parent_id == page.pk:
+                raise ParentValidationError("This parent would create a cycle")
+            seen.add(node.parent_id)
+            node = node.parent
+
+    # Depth: ancestors of the parent + the page itself (+ the moved subtree).
+    depth = _count_ancestors(parent) + 1
+    if page is not None:
+        depth += _subtree_height(page.pk)
+    if depth > MAX_PAGE_DEPTH:
+        raise ParentValidationError(f"Nesting deeper than {MAX_PAGE_DEPTH} levels is not allowed")
+
 
 def unarchive_archive_page_and_descendants(page_id, archived_at):
     # Your SQL query
     sql = """
     WITH RECURSIVE descendants AS (
-        SELECT id FROM pages WHERE id = %s
-        UNION ALL
-        SELECT pages.id FROM pages, descendants WHERE pages.parent_id = descendants.id
+        SELECT id, parent_id FROM pages WHERE id = %s
+        UNION
+        SELECT pages.id, pages.parent_id FROM pages, descendants WHERE pages.parent_id = descendants.id
     )
     UPDATE pages SET archived_at = %s WHERE id IN (SELECT id FROM descendants);
     """
@@ -81,6 +142,13 @@ class PageViewSet(BaseViewSet):
     search_fields = ["name"]
 
     def get_queryset(self):
+        """Roots-only queryset for the flat list and summary endpoints.
+
+        Tree-aware operations (create of a child, retrieve of any node) use
+        get_node_queryset() instead: create() reused this roots-only queryset
+        and failed with DoesNotExist after persisting a child row, and
+        retrieve() returned 404 for every subpage.
+        """
         subquery = UserFavorite.objects.filter(
             user=self.request.user,
             entity_type="page",
@@ -142,7 +210,53 @@ class PageViewSet(BaseViewSet):
             .distinct()
         )
 
+    def get_node_queryset(self, pk):
+        """Queryset for a single node (root or child), scoped to the project and
+        visible to the user. Used by create() to fetch the just-created page and
+        by retrieve() so subpages open by id. Same visibility rule as
+        get_queryset(): owner or public access."""
+        subquery = UserFavorite.objects.filter(
+            user=self.request.user,
+            entity_type="page",
+            entity_identifier=OuterRef("pk"),
+            workspace__slug=self.kwargs.get("slug"),
+        )
+        return (
+            Page.objects.filter(workspace__slug=self.kwargs.get("slug"))
+            .filter(
+                projects__project_projectmember__member=self.request.user,
+                projects__project_projectmember__is_active=True,
+                projects__archived_at__isnull=True,
+            )
+            .filter(Q(owned_by=self.request.user) | Q(access=0))
+            .filter(pk=pk)
+            .prefetch_related("projects", "labels")
+            .select_related("workspace", "owned_by")
+            .annotate(is_favorite=Exists(subquery))
+        )
+
     def create(self, request, slug, project_id):
+        # Parent must exist in this project before anything is written.
+        parent = request.data.get("parent", None)
+        parent_page = None
+        if parent:
+            try:
+                parent_page = Page.objects.get(
+                    pk=parent,
+                    workspace__slug=slug,
+                    projects__id=project_id,
+                    project_pages__deleted_at__isnull=True,
+                )
+            except Page.DoesNotExist:
+                return Response(
+                    {"error": "Parent page not found in this project", "code": ERROR_CODES.get("INVALID_VALUE", "invalid_value")},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                _validate_parent_choice(parent_page, None, project_id)
+            except ParentValidationError as e:
+                return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
         serializer = PageSerializer(
             data=request.data,
             context={
@@ -162,7 +276,10 @@ class PageViewSet(BaseViewSet):
                 old_description_html=None,
                 page_id=serializer.data["id"],
             )
-            page = self.get_queryset().get(pk=serializer.data["id"])
+            # Any node (root or child) must be fetchable after creation: the
+            # roots-only queryset raised DoesNotExist here for children and
+            # turned a persisted write into a 404.
+            page = self.get_node_queryset(serializer.data["id"]).first()
             serializer = PageDetailSerializer(page)
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -181,12 +298,18 @@ class PageViewSet(BaseViewSet):
 
             parent = request.data.get("parent", None)
             if parent:
-                _ = Page.objects.get(
+                parent_page = Page.objects.get(
                     pk=parent,
                     workspace__slug=slug,
                     projects__id=project_id,
                     project_pages__deleted_at__isnull=True,
                 )
+                # Reject self-parent, cycles and nesting beyond the depth limit
+                # before anything is written.
+                try:
+                    _validate_parent_choice(parent_page, page, project_id)
+                except ParentValidationError as e:
+                    return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
             # Only update access if the page owner is the requesting  user
             if page.access != request.data.get("access", page.access) and page.owned_by_id != request.user.id:
@@ -216,7 +339,9 @@ class PageViewSet(BaseViewSet):
             )
 
     def retrieve(self, request, slug, project_id, page_id=None):
-        page = self.get_queryset().filter(pk=page_id).first()
+        # Any node (root or child) must open by id: the roots-only queryset
+        # returned 404 for every subpage.
+        page = self.get_node_queryset(page_id).first()
         track_visit = request.query_params.get("track_visit", "true").lower() == "true"
 
         # Guest access (guest_view_all_features) is enforced by ProjectPagePermission.
