@@ -7,8 +7,8 @@ directly to `makeplane/plane`.
 ## Remotes and protected direction
 
 ```text
-origin  https://github.com/makeplane/plane.git  # upstream, fetch only in practice
-fork    https://github.com/filhocf/plane.git    # DAIA fork, push target
+origin    https://github.com/filhocf/plane.git    # DAIA fork, push target
+upstream  https://github.com/makeplane/plane.git  # canonical Plane, fetch only in practice
 ```
 
 The working branch for the nested Pages and agent API work is:
@@ -17,12 +17,12 @@ The working branch for the nested Pages and agent API work is:
 fork/nested-pages
 ```
 
-Never push DAIA changes to `origin`. Before every push, verify:
+Never push DAIA changes to `upstream`. Before every push, verify:
 
 ```bash
 git remote -v
 git branch -vv
-git push fork fork/nested-pages
+git push origin fork/nested-pages
 ```
 
 ## DAIA patch stack
@@ -74,11 +74,11 @@ feature branch before validation.
 
 ```bash
 git status --short
-git fetch origin --tags --prune
-git fetch fork --prune
+git fetch upstream --tags --prune
+git fetch origin --prune
 git switch fork/nested-pages
 git switch -c maintenance/plane-upstream-YYYYMMDD
-git merge --no-ff origin/preview
+git merge --no-ff upstream/preview
 ```
 
 Resolve conflicts by preserving DAIA invariants, not by mechanically accepting
