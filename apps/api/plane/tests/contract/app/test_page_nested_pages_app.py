@@ -11,11 +11,12 @@ default and is intentional here).
 """
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from rest_framework import status
 
-from plane.db.models import Page, Project, ProjectMember, ProjectPage
+from plane.db.models import Page, Project, ProjectMember, ProjectPage, User
 
 
 def _urls(slug, project_id):
@@ -60,6 +61,7 @@ class TestPageNestedCreate:
 
         assert response.status_code == status.HTTP_201_CREATED
         assert response.data["parent"] == root.id
+        assert str(project.id) in [str(pid) for pid in response.data["project_ids"]]
         child = Page.objects.get(name="Child", workspace=workspace)
         assert child.parent_id == root.id
 
@@ -90,6 +92,27 @@ class TestPageNestedCreate:
         assert response.status_code == status.HTTP_400_BAD_REQUEST
         assert not Page.objects.filter(name="Child", workspace=workspace).exists()
 
+    @pytest.mark.django_db
+    def test_create_child_rejects_invisible_or_archived_parent(self, session_client, workspace, create_user):
+        project = Project.objects.create(name="P", identifier="NIV", workspace=workspace)
+        _member(workspace, project, create_user)
+        other = User.objects.create(username=f"owner-{uuid.uuid4().hex}", email=f"{uuid.uuid4().hex}@plane.so")
+        hidden = _make_page(workspace, project, other, "Hidden")
+        hidden.access = Page.PRIVATE_ACCESS
+        hidden.save(update_fields=["access"])
+        archived = _make_page(workspace, project, create_user, "Archived")
+        archived.archived_at = datetime(2026, 11, 24, 12, tzinfo=timezone.utc)
+        archived.save(update_fields=["archived_at"])
+        hidden_ancestor = _make_page(workspace, project, other, "Hidden ancestor")
+        hidden_ancestor.access = Page.PRIVATE_ACCESS
+        hidden_ancestor.save(update_fields=["access"])
+        public_child = _make_page(workspace, project, other, "Public under hidden", parent=hidden_ancestor)
+        url = _urls(workspace.slug, project.id)
+        for parent in (hidden, archived, public_child):
+            response = session_client.post(url, {"name": "Child", "parent": str(parent.id)}, format="json")
+            assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert not Page.objects.filter(name="Child", workspace=workspace).exists()
+
 
 @pytest.mark.contract
 class TestPageNestedRetrieve:
@@ -105,6 +128,7 @@ class TestPageNestedRetrieve:
 
         assert response.status_code == status.HTTP_200_OK
         assert response.data["parent"] == root.id
+        assert str(project.id) in [str(pid) for pid in response.data["project_ids"]]
 
     @pytest.mark.django_db
     def test_list_returns_roots_only(self, session_client, workspace, create_user):
@@ -183,6 +207,21 @@ class TestPageNestedUpdate:
 
 @pytest.mark.contract
 class TestPageNestedArchive:
+    @pytest.mark.django_db
+    def test_archived_child_is_listed_and_counted(self, session_client, workspace, create_user):
+        project = Project.objects.create(name="P", identifier="NAR", workspace=workspace)
+        _member(workspace, project, create_user)
+        root = _make_page(workspace, project, create_user, "Root")
+        child = _make_page(workspace, project, create_user, "Child", parent=root)
+        url = _urls(workspace.slug, project.id)
+        assert session_client.post(f"{url}{child.id}/archive/").status_code == status.HTTP_200_OK
+        archived = session_client.get(f"{url}?show_archived=true")
+        assert archived.status_code == status.HTTP_200_OK
+        assert [str(page["id"]) for page in archived.data] == [str(child.id)]
+        assert session_client.get(
+            f"/api/workspaces/{workspace.slug}/projects/{project.id}/pages-summary/"
+        ).data["archived_pages"] == 1
+
     @pytest.mark.django_db
     def test_archive_cascades_to_descendants(self, session_client, workspace, create_user):
         project = Project.objects.create(name="P", identifier="NAC", workspace=workspace)

@@ -8,7 +8,7 @@ from datetime import datetime
 from django.core.serializers.json import DjangoJSONEncoder
 
 # Django imports
-from django.db import connection
+from django.db import transaction
 from django.db.models import (
     Exists,
     OuterRef,
@@ -72,7 +72,9 @@ def _count_ancestors(page):
     """Number of ancestors of a page. Walks parent links with a visited set so
     a (corrupted) cyclic graph cannot loop forever."""
     count, seen, node = 0, set(), page
-    while node.parent_id is not None and node.parent_id not in seen:
+    while node.parent_id is not None:
+        if node.parent_id in seen:
+            raise ParentValidationError("The existing page hierarchy contains a cycle")
         seen.add(node.parent_id)
         count += 1
         node = node.parent
@@ -119,30 +121,38 @@ def _validate_parent_choice(parent, page, project_id):
         raise ParentValidationError(f"Nesting deeper than {MAX_PAGE_DEPTH} levels is not allowed")
 
 
-def unarchive_archive_page_and_descendants(page_id, archived_at):
-    # Your SQL query
-    sql = """
-    WITH RECURSIVE descendants AS (
-        SELECT id, parent_id FROM pages WHERE id = %s
-        UNION
-        SELECT pages.id, pages.parent_id FROM pages, descendants WHERE pages.parent_id = descendants.id
-    )
-    UPDATE pages SET archived_at = %s WHERE id IN (SELECT id FROM descendants);
-    """
-
-    # Execute the SQL query
-    with connection.cursor() as cursor:
-        cursor.execute(sql, [page_id, archived_at])
-
-
 class PageViewSet(BaseViewSet):
     serializer_class = PageSerializer
     model = Page
     permission_classes = [ProjectPagePermission]
     search_fields = ["name"]
 
+    def _project_tree_lock(self, slug, project_id):
+        return Project.objects.select_for_update().get(
+            pk=project_id,
+            workspace__slug=slug,
+            archived_at__isnull=True,
+        )
+
+    @staticmethod
+    def _project_descendant_ids(page_id, project_id):
+        ids, pending = [], [page_id]
+        while pending:
+            current = pending.pop()
+            if current in ids:
+                continue
+            ids.append(current)
+            pending.extend(
+                Page.objects.filter(
+                    parent_id=current,
+                    project_pages__project_id=project_id,
+                    project_pages__deleted_at__isnull=True,
+                ).values_list("id", flat=True)
+            )
+        return ids
+
     def get_queryset(self):
-        """Roots-only queryset for the flat list and summary endpoints.
+        """Project-scoped queryset; flat active list is roots-only.
 
         Tree-aware operations (create of a child, retrieve of any node) use
         get_node_queryset() instead: create() reused this roots-only queryset
@@ -155,7 +165,7 @@ class PageViewSet(BaseViewSet):
             entity_identifier=OuterRef("pk"),
             workspace__slug=self.kwargs.get("slug"),
         )
-        return self.filter_queryset(
+        queryset = (
             super()
             .get_queryset()
             .filter(workspace__slug=self.kwargs.get("slug"))
@@ -164,7 +174,6 @@ class PageViewSet(BaseViewSet):
                 projects__project_projectmember__is_active=True,
                 projects__archived_at__isnull=True,
             )
-            .filter(parent__isnull=True)
             .filter(Q(owned_by=self.request.user) | Q(access=0))
             .prefetch_related("projects")
             .select_related("workspace")
@@ -209,6 +218,9 @@ class PageViewSet(BaseViewSet):
             .filter(project=True)
             .distinct()
         )
+        if self.action != "list" or self.request.GET.get("show_archived") != "true":
+            queryset = queryset.filter(parent__isnull=True)
+        return self.filter_queryset(queryset)
 
     def get_node_queryset(self, pk):
         """Queryset for a single node (root or child), scoped to the project and
@@ -221,8 +233,12 @@ class PageViewSet(BaseViewSet):
             entity_identifier=OuterRef("pk"),
             workspace__slug=self.kwargs.get("slug"),
         )
-        return (
-            Page.objects.filter(workspace__slug=self.kwargs.get("slug"))
+        queryset = (
+            Page.objects.filter(
+                workspace__slug=self.kwargs.get("slug"),
+                project_pages__project_id=self.kwargs.get("project_id"),
+                project_pages__deleted_at__isnull=True,
+            )
             .filter(
                 projects__project_projectmember__member=self.request.user,
                 projects__project_projectmember__is_active=True,
@@ -233,30 +249,46 @@ class PageViewSet(BaseViewSet):
             .prefetch_related("projects", "labels")
             .select_related("workspace", "owned_by")
             .annotate(is_favorite=Exists(subquery))
+            .annotate(
+                label_ids=Coalesce(
+                    ArrayAgg("page_labels__label_id", distinct=True, filter=~Q(page_labels__label_id__isnull=True)),
+                    Value([], output_field=ArrayField(UUIDField())),
+                ),
+                project_ids=Coalesce(
+                    ArrayAgg("projects__id", distinct=True, filter=~Q(projects__id__isnull=True)),
+                    Value([], output_field=ArrayField(UUIDField())),
+                ),
+            )
+            .distinct()
         )
+        page = queryset.first()
+        if page is None:
+            return queryset
+        try:
+            self._visible_parent(
+                self.request,
+                self.kwargs.get("slug"),
+                self.kwargs.get("project_id"),
+                page.pk,
+            )
+        except Page.DoesNotExist:
+            return queryset.none()
+        return queryset
+
+    def _visible_parent(self, request, slug, project_id, parent_id):
+        """A parent must be visible and every ancestor must be reachable."""
+        pages = self._tree_visible_nodes(request, slug, project_id)
+        parent = pages.get(pk=parent_id)
+        seen = {parent.pk}
+        node = parent
+        while node.parent_id is not None:
+            if node.parent_id in seen:
+                raise Page.DoesNotExist
+            seen.add(node.parent_id)
+            node = pages.get(pk=node.parent_id)
+        return parent
 
     def create(self, request, slug, project_id):
-        # Parent must exist in this project before anything is written.
-        parent = request.data.get("parent", None)
-        parent_page = None
-        if parent:
-            try:
-                parent_page = Page.objects.get(
-                    pk=parent,
-                    workspace__slug=slug,
-                    projects__id=project_id,
-                    project_pages__deleted_at__isnull=True,
-                )
-            except Page.DoesNotExist:
-                return Response(
-                    {"error": "Parent page not found in this project", "code": ERROR_CODES.get("INVALID_VALUE", "invalid_value")},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            try:
-                _validate_parent_choice(parent_page, None, project_id)
-            except ParentValidationError as e:
-                return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
         serializer = PageSerializer(
             data=request.data,
             context={
@@ -269,7 +301,24 @@ class PageViewSet(BaseViewSet):
         )
 
         if serializer.is_valid():
-            serializer.save()
+            with transaction.atomic():
+                self._project_tree_lock(slug, project_id)
+                parent = request.data.get("parent", None)
+                if parent:
+                    try:
+                        parent_page = self._visible_parent(request, slug, project_id, parent)
+                        _validate_parent_choice(parent_page, None, project_id)
+                    except Page.DoesNotExist:
+                        return Response(
+                            {
+                                "error": "Parent page not found in this project",
+                                "code": ERROR_CODES.get("INVALID_VALUE", "invalid_value"),
+                            },
+                            status=status.HTTP_400_BAD_REQUEST,
+                        )
+                    except ParentValidationError as e:
+                        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+                serializer.save()
             # capture the page transaction
             page_transaction.delay(
                 new_description_html=request.data.get("description_html", "<p></p>"),
@@ -286,41 +335,33 @@ class PageViewSet(BaseViewSet):
 
     def partial_update(self, request, slug, project_id, page_id):
         try:
-            page = Page.objects.get(
-                pk=page_id,
-                workspace__slug=slug,
-                projects__id=project_id,
-                project_pages__deleted_at__isnull=True,
-            )
-
-            if page.is_locked:
-                return Response({"error": "Page is locked"}, status=status.HTTP_400_BAD_REQUEST)
-
-            parent = request.data.get("parent", None)
-            if parent:
-                parent_page = Page.objects.get(
-                    pk=parent,
+            with transaction.atomic():
+                self._project_tree_lock(slug, project_id)
+                page = Page.objects.select_for_update().get(
+                    pk=page_id,
                     workspace__slug=slug,
                     projects__id=project_id,
                     project_pages__deleted_at__isnull=True,
                 )
-                # Reject self-parent, cycles and nesting beyond the depth limit
-                # before anything is written.
-                try:
+
+                if page.is_locked:
+                    return Response({"error": "Page is locked"}, status=status.HTTP_400_BAD_REQUEST)
+
+                parent = request.data.get("parent", None)
+                if parent:
+                    parent_page = self._visible_parent(request, slug, project_id, parent)
                     _validate_parent_choice(parent_page, page, project_id)
-                except ParentValidationError as e:
-                    return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
-            # Only update access if the page owner is the requesting  user
-            if page.access != request.data.get("access", page.access) and page.owned_by_id != request.user.id:
-                return Response(
-                    {"error": "Access cannot be updated since this page is owned by someone else"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                if page.access != request.data.get("access", page.access) and page.owned_by_id != request.user.id:
+                    return Response(
+                        {"error": "Access cannot be updated since this page is owned by someone else"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
-            serializer = PageDetailSerializer(page, data=request.data, partial=True)
-            page_description = page.description_html
-            if serializer.is_valid():
+                serializer = PageDetailSerializer(page, data=request.data, partial=True)
+                page_description = page.description_html
+                if not serializer.is_valid():
+                    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
                 serializer.save()
                 # capture the page transaction
                 if request.data.get("description_html"):
@@ -329,12 +370,10 @@ class PageViewSet(BaseViewSet):
                         old_description_html=page_description,
                         page_id=page_id,
                     )
-
                 return Response(serializer.data, status=status.HTTP_200_OK)
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        except Page.DoesNotExist:
+        except (Page.DoesNotExist, ParentValidationError) as exc:
             return Response(
-                {"error": "Access cannot be updated since this page is owned by someone else"},
+                {"error": str(exc) or "Page or parent not found"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -362,6 +401,64 @@ class PageViewSet(BaseViewSet):
                     project_id=project_id,
                 )
             return Response(data, status=status.HTTP_200_OK)
+
+    def _tree_visible_nodes(self, request, slug, project_id):
+        """Same node-level visibility as retrieve, with an active project link."""
+        pages = Page.objects.filter(
+            workspace__slug=slug,
+            project_pages__project_id=project_id,
+            project_pages__deleted_at__isnull=True,
+            project_pages__project__archived_at__isnull=True,
+            archived_at__isnull=True,
+        ).filter(Q(owned_by=request.user) | Q(access=Page.PUBLIC_ACCESS))
+        project = Project.objects.filter(pk=project_id, workspace__slug=slug).first()
+        role = ProjectMember.objects.filter(
+            project_id=project_id,
+            member=request.user,
+            is_active=True,
+            deleted_at__isnull=True,
+        ).values_list("role", flat=True).first()
+        if role is None:
+            return pages.none()
+        if role == ROLE.GUEST.value and project and not project.guest_view_all_features:
+            pages = pages.filter(owned_by=request.user)
+        return pages
+
+    @staticmethod
+    def _tree_page_data(pages, project_id):
+        """Include the current project for the app's page navigation store."""
+        data = PageSerializer(pages, many=True).data
+        for item in data:
+            item["project_ids"] = [str(project_id)]
+        return data
+
+    def children(self, request, slug, project_id, page_id):
+        # Permission class checks the requested parent's scope and visibility.
+        pages = self._tree_visible_nodes(request, slug, project_id)
+        if not pages.filter(pk=page_id).exists():
+            return Response({"error": "Page not found"}, status=status.HTTP_404_NOT_FOUND)
+        children = pages.filter(parent_id=page_id).annotate(
+            is_favorite=Exists(UserFavorite.objects.filter(
+                user=request.user, entity_type="page", entity_identifier=OuterRef("pk"), workspace__slug=slug
+            ))
+        ).order_by("sort_order", "created_at", "id")
+        return Response(self._tree_page_data(children, project_id))
+
+    def ancestors(self, request, slug, project_id, page_id):
+        pages = self._tree_visible_nodes(request, slug, project_id)
+        target = pages.filter(pk=page_id).first()
+        if target is None:
+            return Response({"error": "Page not found"}, status=status.HTTP_404_NOT_FOUND)
+        chain, seen, parent_id = [], {target.pk}, target.parent_id
+        while parent_id is not None and parent_id not in seen:
+            seen.add(parent_id)
+            ancestor = pages.filter(pk=parent_id).first()
+            if ancestor is None:
+                break  # no visibility through an invisible ancestor
+            chain.append(ancestor)
+            parent_id = ancestor.parent_id
+        chain.reverse()
+        return Response(self._tree_page_data(chain, project_id))
 
     def lock(self, request, slug, project_id, page_id):
         page = Page.objects.get(
@@ -410,6 +507,10 @@ class PageViewSet(BaseViewSet):
 
     def list(self, request, slug, project_id):
         queryset = self.get_queryset()
+        if request.GET.get("show_archived") == "true":
+            queryset = queryset.filter(archived_at__isnull=False)
+        else:
+            queryset = queryset.filter(archived_at__isnull=True)
         project = Project.objects.get(pk=project_id)
         if (
             ProjectMember.objects.filter(
@@ -426,62 +527,72 @@ class PageViewSet(BaseViewSet):
         return Response(pages, status=status.HTTP_200_OK)
 
     def archive(self, request, slug, project_id, page_id):
-        page = Page.objects.get(
-            pk=page_id,
-            workspace__slug=slug,
-            projects__id=project_id,
-            project_pages__deleted_at__isnull=True,
-        )
-
-        # only the owner or admin can archive the page
-        if (
-            ProjectMember.objects.filter(
-                project_id=project_id, member=request.user, is_active=True, role__lte=15
-            ).exists()
-            and request.user.id != page.owned_by_id
-        ):
-            return Response(
-                {"error": "Only the owner or admin can archive the page"},
-                status=status.HTTP_400_BAD_REQUEST,
+        with transaction.atomic():
+            self._project_tree_lock(slug, project_id)
+            page = Page.objects.select_for_update().get(
+                pk=page_id,
+                workspace__slug=slug,
+                projects__id=project_id,
+                project_pages__deleted_at__isnull=True,
             )
 
-        UserFavorite.objects.filter(
-            entity_type="page",
-            entity_identifier=page_id,
-            project_id=project_id,
-            workspace__slug=slug,
-        ).delete()
+            # only the owner or admin can archive the page
+            if (
+                ProjectMember.objects.filter(
+                    project_id=project_id, member=request.user, is_active=True, role__lte=15
+                ).exists()
+                and request.user.id != page.owned_by_id
+            ):
+                return Response(
+                    {"error": "Only the owner or admin can archive the page"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            ids = self._project_descendant_ids(page_id, project_id)
+            list(Page.objects.select_for_update().filter(id__in=ids).order_by("id"))
+            ids = self._project_descendant_ids(page_id, project_id)
+            if Page.objects.filter(id__in=ids, is_locked=True).exists():
+                return Response({"error": "A page in the subtree is locked"}, status=status.HTTP_409_CONFLICT)
+            UserFavorite.objects.filter(
+                entity_type="page",
+                entity_identifier__in=ids,
+                project_id=project_id,
+                workspace__slug=slug,
+            ).delete()
+            archived_at = datetime.now()
+            Page.objects.filter(id__in=ids).update(archived_at=archived_at)
 
-        unarchive_archive_page_and_descendants(page_id, datetime.now())
-
-        return Response({"archived_at": str(datetime.now())}, status=status.HTTP_200_OK)
+        return Response({"archived_at": str(archived_at)}, status=status.HTTP_200_OK)
 
     def unarchive(self, request, slug, project_id, page_id):
-        page = Page.objects.get(
-            pk=page_id,
-            workspace__slug=slug,
-            projects__id=project_id,
-            project_pages__deleted_at__isnull=True,
-        )
-
-        # only the owner or admin can un archive the page
-        if (
-            ProjectMember.objects.filter(
-                project_id=project_id, member=request.user, is_active=True, role__lte=15
-            ).exists()
-            and request.user.id != page.owned_by_id
-        ):
-            return Response(
-                {"error": "Only the owner or admin can un archive the page"},
-                status=status.HTTP_400_BAD_REQUEST,
+        with transaction.atomic():
+            self._project_tree_lock(slug, project_id)
+            page = Page.objects.select_for_update().get(
+                pk=page_id,
+                workspace__slug=slug,
+                projects__id=project_id,
+                project_pages__deleted_at__isnull=True,
             )
 
-        # if parent archived then page will be un archived breaking hierarchy
-        if page.parent_id and page.parent.archived_at:
-            page.parent = None
-            page.save(update_fields=["parent"])
-
-        unarchive_archive_page_and_descendants(page_id, None)
+            # only the owner or admin can un archive the page
+            if (
+                ProjectMember.objects.filter(
+                    project_id=project_id, member=request.user, is_active=True, role__lte=15
+                ).exists()
+                and request.user.id != page.owned_by_id
+            ):
+                return Response(
+                    {"error": "Only the owner or admin can un archive the page"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            ids = self._project_descendant_ids(page_id, project_id)
+            list(Page.objects.select_for_update().filter(id__in=ids).order_by("id"))
+            ids = self._project_descendant_ids(page_id, project_id)
+            if Page.objects.filter(id__in=ids, is_locked=True).exists():
+                return Response({"error": "A page in the subtree is locked"}, status=status.HTTP_409_CONFLICT)
+            if page.parent_id and page.parent.archived_at:
+                page.parent = None
+                page.save(update_fields=["parent", "updated_at"])
+            Page.objects.filter(id__in=ids).update(archived_at=None)
 
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -546,7 +657,6 @@ class PageViewSet(BaseViewSet):
                 projects__project_projectmember__is_active=True,
                 projects__archived_at__isnull=True,
             )
-            .filter(parent__isnull=True)
             .filter(Q(owned_by=request.user) | Q(access=0))
             .annotate(
                 project=Exists(
