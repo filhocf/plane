@@ -35,8 +35,21 @@ The branch currently starts from upstream `v1.5.1-rc1` / `preview` commit
    pagination, archive/restore, safe two-phase deletion, authorization and
    concurrency controls.
 
-Additional nested-Pages UI and app-API work may exist as local, uncommitted
-changes. Inspect `git status` before an update and never discard that work.
+The remaining nested-Pages app API, UI, store and publisher layer is maintained
+on the same branch. Inspect `git status` before an update and never discard
+local work.
+
+Primary files for this layer:
+
+```text
+apps/api/plane/app/views/page/base.py
+apps/api/plane/app/urls/page.py
+apps/web/components/pages/list/
+apps/web/components/pages/editor/page-root.tsx
+apps/web/store/pages/project-page.store.ts
+apps/web/services/page/project-page.service.ts
+tools/publish_nested_pages.py
+```
 
 ## External Pages API added by DAIA
 
@@ -116,6 +129,26 @@ git diff --check
 Also execute the nested-Pages backend, frontend, i18n, build and browser E2E
 gates before promotion. Obtain an independent G5 review after every upstream
 merge because permissions, hierarchy and soft deletion are security-sensitive.
+
+The focused nested-Pages gates are:
+
+```bash
+podman exec -e DJANGO_SETTINGS_MODULE=plane.settings.test -w /code plane-api \
+  python -m pytest -q \
+  plane/tests/contract/app/test_page_nested_pages_app.py \
+  plane/tests/contract/app/test_page_tree_endpoints_app.py \
+  plane/tests/contract/api/test_page_api_key.py \
+  plane/tests/contract/api/test_page_lifecycle_api_key.py
+
+PYTHONPATH=tools python3 -m unittest -v tools/test_publish_nested_pages.py
+python3 -m py_compile tools/publish_nested_pages.py tools/test_publish_nested_pages.py
+corepack pnpm --filter=web check:types
+corepack pnpm --filter=web check:lint
+corepack pnpm --filter=@plane/types check:types
+corepack pnpm --filter=@plane/i18n sync:check --ci
+corepack pnpm --filter=web build
+git diff --check
+```
 
 When green, publish the integration branch to the fork and merge it into
 `fork/nested-pages` through the fork's normal review flow.
