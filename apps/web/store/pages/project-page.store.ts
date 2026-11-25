@@ -75,6 +75,7 @@ export class ProjectPageStore implements IProjectPageStore {
   data: Record<string, TProjectPage> = {}; // pageId => Page
   nodeMap: Record<string, string[]> = {};
   private childrenRequestGeneration: Record<string, number> = {};
+  private listRequestGeneration = 0;
   error: TError | undefined = undefined;
   filters: TPageFilters = {
     searchQuery: "",
@@ -217,6 +218,11 @@ export class ProjectPageStore implements IProjectPageStore {
    * @description fetch all the pages
    */
   fetchPagesList = async (workspaceSlug: string, projectId: string, pageType?: TPageNavigationTabs) => {
+    const generation = ++this.listRequestGeneration;
+    const isCurrentRequest = () =>
+      this.store.router.workspaceSlug === workspaceSlug &&
+      this.store.router.projectId === projectId &&
+      this.listRequestGeneration === generation;
     try {
       if (!workspaceSlug || !projectId) return undefined;
 
@@ -227,6 +233,7 @@ export class ProjectPageStore implements IProjectPageStore {
       });
 
       const pages = await this.service.fetchAll(workspaceSlug, projectId, pageType === "archived");
+      if (!isCurrentRequest()) return undefined;
       runInAction(() => {
         const returnedPageIds = new Set(pages.flatMap((page) => (page.id ? [page.id] : [])));
         for (const page of pages) {
@@ -269,6 +276,7 @@ export class ProjectPageStore implements IProjectPageStore {
 
       return pages;
     } catch (error) {
+      if (!isCurrentRequest()) return undefined;
       runInAction(() => {
         this.loader = undefined;
         this.error = {
@@ -414,22 +422,18 @@ export class ProjectPageStore implements IProjectPageStore {
 
       if (shouldSync) await this.service.remove(workspaceSlug, projectId, pageId);
       runInAction(() => {
-        const removedIds = new Set<string>();
-        const collect = (id: string) => {
-          if (removedIds.has(id)) return;
-          removedIds.add(id);
-          for (const childId of this.nodeMap[id] ?? []) collect(childId);
-        };
-        collect(pageId);
-        for (const id of removedIds) {
-          unset(this.data, [id]);
-          unset(this.nodeMap, [id]);
-          unset(this.childrenRequestGeneration, [id]);
-          if (this.rootStore.favorite.entityMap[id]) this.rootStore.favorite.removeFavoriteFromStore(id);
+        const directChildIds = [...(this.nodeMap[pageId] ?? [])];
+        for (const childId of directChildIds) {
+          const child = this.data[childId];
+          if (child) child.mutateProperties({ parent: null }, false);
         }
+        unset(this.data, [pageId]);
+        unset(this.nodeMap, [pageId]);
+        unset(this.childrenRequestGeneration, [pageId]);
+        if (this.rootStore.favorite.entityMap[pageId]) this.rootStore.favorite.removeFavoriteFromStore(pageId);
         for (const ids of Object.values(this.nodeMap)) {
           for (let index = ids.length - 1; index >= 0; index--) {
-            if (removedIds.has(ids[index])) ids.splice(index, 1);
+            if (ids[index] === pageId) ids.splice(index, 1);
           }
         }
       });
