@@ -10,11 +10,12 @@ import { observer } from "mobx-react";
 import type { CollaborationState, EditorRefApi } from "@plane/editor";
 import { useTranslation } from "@plane/i18n";
 import type { TDocumentPayload, TPage, TPageVersion, TWebhookConnectionQueryParams } from "@plane/types";
+import { ControlLink } from "@plane/blocks/layout";
 // hooks
 import { usePageFallback } from "@/hooks/use-page-fallback";
 import type { PageUpdateHandler, TCustomEventHandlers } from "@/hooks/use-realtime-page-events";
 import { usePagesPaneExtensions, useExtendedEditorProps } from "@/hooks/pages";
-import type { EPageStoreType } from "@/hooks/store";
+import { EPageStoreType, usePageStore } from "@/hooks/store";
 // store
 import type { TPageInstance } from "@/store/pages/base-page";
 // ui
@@ -64,6 +65,24 @@ export const PageRoot = observer(function PageRoot(props: TPageRootProps) {
   const [editorReady, setEditorReady] = useState(false);
   const [collaborationState, setCollaborationState] = useState<CollaborationState | null>(null);
   const [showContentTooLargeBanner, setShowContentTooLargeBanner] = useState(false);
+  const [ancestors, setAncestors] = useState<TPage[]>([]);
+  const { fetchAncestors } = usePageStore(storeType);
+  useEffect(() => {
+    if (!projectId || storeType !== EPageStoreType.PROJECT || !page.id) return;
+    let active = true;
+    setAncestors([]);
+    void fetchAncestors(page.id)
+      .then((nodes) => {
+        if (active) setAncestors(nodes);
+        return nodes;
+      })
+      .catch(() => {
+        if (active) setAncestors([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [fetchAncestors, page.id, projectId, storeType]);
   // translation
   const { t } = useTranslation();
   // refs
@@ -167,6 +186,31 @@ export const PageRoot = observer(function PageRoot(props: TPageRootProps) {
         />
         {showContentTooLargeBanner && (
           <Banner placement="page" variant="warning" title={t("page_content_limit_banner.message")} />
+        )}
+        {projectId && storeType === EPageStoreType.PROJECT && (
+          <nav
+            aria-label={t("nested_pages.breadcrumb")}
+            className="flex min-w-0 items-center gap-2 overflow-hidden px-page-x py-2 text-body-xs-regular"
+          >
+            <ControlLink href={`/${workspaceSlug}/projects/${projectId}/pages`}>
+              {t("nested_pages.pages")}
+            </ControlLink>
+            {ancestors.map((ancestor) => (
+              <span key={ancestor.id} className="flex min-w-0 items-center gap-2">
+                <span aria-hidden="true">/</span>
+                <ControlLink
+                  className="truncate"
+                  href={`/${workspaceSlug}/projects/${projectId}/pages/${ancestor.id}`}
+                >
+                  {ancestor.name}
+                </ControlLink>
+              </span>
+            ))}
+            <span aria-hidden="true">/</span>
+            <span aria-current="page" className="truncate">
+              {page.name}
+            </span>
+          </nav>
         )}
         {/* positioning context for the floating navigation pane button when the toolbar is hidden */}
         <div className="relative flex min-h-0 w-full flex-1 flex-col overflow-hidden">

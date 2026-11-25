@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "Bol dosiahnutý limit obsahu a živá synchronizácia je vypnutá. Vytvorte novú stránku alebo použite vnorené stránky na pokračovanie synchronizácie."
+  },
+  "nested_pages": {
+    "create_error": "Could not create subpage.",
+    "collapse": "Collapse {title}",
+    "expand": "Expand {title}",
+    "create_child": "Create subpage of {title}",
+    "loading": "Loading subpages…",
+    "load_error": "Could not load subpages.",
+    "retry": "Try again",
+    "empty": "No subpages",
+    "breadcrumb": "Page hierarchy",
+    "pages": "Pages"
   }
 }

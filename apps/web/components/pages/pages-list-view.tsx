@@ -28,7 +28,7 @@ export const PagesListView = observer(function PagesListView(props: TPageView) {
   const { isAnyPageAvailable, fetchPagesList } = usePageStore(storeType);
   // fetching pages list
   useSWR(
-    workspaceSlug && projectId && pageType ? `PROJECT_PAGES_${projectId}` : null,
+    workspaceSlug && projectId && pageType ? `PROJECT_PAGES_${projectId}_${pageType}` : null,
     workspaceSlug && projectId && pageType ? () => fetchPagesList(workspaceSlug, projectId, pageType) : null
   );
 

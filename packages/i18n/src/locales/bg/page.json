@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "Лимитът за съдържание е достигнат и синхронизирането в реално време е изключено. Създайте нова страница или използвайте вложени страници, за да продължите синхронизирането."
+  },
+  "nested_pages": {
+    "create_error": "Could not create subpage.",
+    "collapse": "Collapse {title}",
+    "expand": "Expand {title}",
+    "create_child": "Create subpage of {title}",
+    "loading": "Loading subpages…",
+    "load_error": "Could not load subpages.",
+    "retry": "Try again",
+    "empty": "No subpages",
+    "breadcrumb": "Page hierarchy",
+    "pages": "Pages"
   }
 }

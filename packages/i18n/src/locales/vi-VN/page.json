@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "Đã đạt giới hạn nội dung và đồng bộ trực tiếp đã tắt. Tạo trang mới hoặc dùng trang lồng nhau để tiếp tục đồng bộ."
+  },
+  "nested_pages": {
+    "create_error": "Could not create subpage.",
+    "collapse": "Collapse {title}",
+    "expand": "Expand {title}",
+    "create_child": "Create subpage of {title}",
+    "loading": "Loading subpages…",
+    "load_error": "Could not load subpages.",
+    "retry": "Try again",
+    "empty": "No subpages",
+    "breadcrumb": "Page hierarchy",
+    "pages": "Pages"
   }
 }

@@ -37,6 +37,7 @@ export interface IProjectPageStore {
   // observables
   loader: TLoader;
   data: Record<string, TProjectPage>; // pageId => Page
+  nodeMap: Record<string, string[]>; // parentId => direct visible child ids
   error: TError | undefined;
   filters: TPageFilters;
   // computed
@@ -61,6 +62,8 @@ export interface IProjectPageStore {
     pageId: string,
     options?: { trackVisit?: boolean }
   ) => Promise<TPage | undefined>;
+  fetchChildren: (pageId: string, force?: boolean) => Promise<TPage[]>;
+  fetchAncestors: (pageId: string) => Promise<TPage[]>;
   createPage: (pageData: Partial<TPage>) => Promise<TPage | undefined>;
   removePage: (params: { pageId: string; shouldSync?: boolean }) => Promise<void>;
   movePage: (workspaceSlug: string, projectId: string, pageId: string, newProjectId: string) => Promise<void>;
@@ -70,6 +73,8 @@ export class ProjectPageStore implements IProjectPageStore {
   // observables
   loader: TLoader = "init-loader";
   data: Record<string, TProjectPage> = {}; // pageId => Page
+  nodeMap: Record<string, string[]> = {};
+  private childrenRequestGeneration: Record<string, number> = {};
   error: TError | undefined = undefined;
   filters: TPageFilters = {
     searchQuery: "",
@@ -85,6 +90,7 @@ export class ProjectPageStore implements IProjectPageStore {
       // observables
       loader: observable.ref,
       data: observable,
+      nodeMap: observable,
       error: observable,
       filters: observable,
       // computed
@@ -96,6 +102,7 @@ export class ProjectPageStore implements IProjectPageStore {
       // actions
       fetchPagesList: action,
       fetchPageDetails: action,
+      fetchChildren: action,
       createPage: action,
       removePage: action,
       movePage: action,
@@ -109,6 +116,7 @@ export class ProjectPageStore implements IProjectPageStore {
       (projectId) => {
         if (!projectId) return;
         this.filters.searchQuery = "";
+        this.nodeMap = {};
       }
     );
   }
@@ -142,7 +150,9 @@ export class ProjectPageStore implements IProjectPageStore {
     if (!projectId) return undefined;
     // helps to filter pages based on the pageType
     let pagesByType = filterPagesByPageType(pageType, Object.values(this?.data || {}));
-    pagesByType = pagesByType.filter((p) => p.project_ids?.includes(projectId));
+    pagesByType = pagesByType.filter(
+      (p) => p.project_ids?.includes(projectId) && (pageType === "archived" || !p.parent)
+    );
 
     const pages = (pagesByType.map((page) => page.id) as string[]) || undefined;
 
@@ -172,6 +182,7 @@ export class ProjectPageStore implements IProjectPageStore {
     let filteredPages = pagesByType.filter(
       (p) =>
         p.project_ids?.includes(projectId) &&
+        (pageType === "archived" || !p.parent) &&
         getPageName(p.name).toLowerCase().includes(this.filters.searchQuery.toLowerCase()) &&
         shouldFilterPage(p, this.filters.filters)
     );
@@ -215,8 +226,9 @@ export class ProjectPageStore implements IProjectPageStore {
         this.error = undefined;
       });
 
-      const pages = await this.service.fetchAll(workspaceSlug, projectId);
+      const pages = await this.service.fetchAll(workspaceSlug, projectId, pageType === "archived");
       runInAction(() => {
+        const returnedPageIds = new Set(pages.flatMap((page) => (page.id ? [page.id] : [])));
         for (const page of pages) {
           if (page?.id) {
             const existingPage = this.getPageById(page.id);
@@ -229,6 +241,27 @@ export class ProjectPageStore implements IProjectPageStore {
               // If new page, create a new instance with all data
               set(this.data, [page.id], new ProjectPage(this.store, page));
             }
+          }
+        }
+        // Archive/restore mutates an existing instance optimistically. Prune
+        // entries that no longer belong to the fetched tab so a restored page
+        // cannot remain duplicated in Archived and stale children disappear
+        // from an already expanded parent.
+        for (const [pageId, page] of Object.entries(this.data)) {
+          if (!page.project_ids?.includes(projectId) || returnedPageIds.has(pageId)) continue;
+          const belongsToFetchedTab =
+            pageType === "archived"
+              ? !!page.archived_at
+              : pageType === "private"
+                ? !page.archived_at && page.access === 1
+                : pageType === "public"
+                  ? !page.archived_at && page.access === 0
+                  : !page.archived_at;
+          if (belongsToFetchedTab) unset(this.data, [pageId]);
+        }
+        for (const ids of Object.values(this.nodeMap)) {
+          for (let index = ids.length - 1; index >= 0; index--) {
+            if (!this.data[ids[index]]) ids.splice(index, 1);
           }
         }
         this.loader = undefined;
@@ -290,6 +323,47 @@ export class ProjectPageStore implements IProjectPageStore {
     }
   };
 
+  fetchChildren = async (pageId: string, force = false): Promise<TPage[]> => {
+    const { workspaceSlug, projectId } = this.store.router;
+    if (!workspaceSlug || !projectId) return [];
+    if (!force && this.nodeMap[pageId]) {
+      const cached = this.nodeMap[pageId].flatMap((id) => {
+        const page = this.data[id]?.asJSON;
+        return page && !page.archived_at ? [page] : [];
+      });
+      if (cached.length === this.nodeMap[pageId].length) return cached;
+    }
+    const generation = (this.childrenRequestGeneration[pageId] ?? 0) + 1;
+    this.childrenRequestGeneration[pageId] = generation;
+    const pages = await this.service.fetchChildren(workspaceSlug, projectId, pageId);
+    // A late response from a previous project must never populate the current tree.
+    if (
+      this.store.router.projectId !== projectId ||
+      this.store.router.workspaceSlug !== workspaceSlug ||
+      this.childrenRequestGeneration[pageId] !== generation
+    )
+      return [];
+    runInAction(() => {
+      this.nodeMap[pageId] = pages.flatMap((page) => (page.id ? [page.id] : []));
+      for (const page of pages) {
+        if (!page.id) continue;
+        // Children API returns a project-scoped page, but shared pages can have
+        // no project_ids on the wire. Keep the current project for navigation.
+        const scopedPage = { ...page, project_ids: page.project_ids?.length ? page.project_ids : [projectId] };
+        const existing = this.data[page.id];
+        if (existing) existing.mutateProperties(scopedPage, false);
+        else set(this.data, [page.id], new ProjectPage(this.store, scopedPage));
+      }
+    });
+    return pages;
+  };
+
+  fetchAncestors = async (pageId: string): Promise<TPage[]> => {
+    const { workspaceSlug, projectId } = this.store.router;
+    if (!workspaceSlug || !projectId) return [];
+    return this.service.fetchAncestors(workspaceSlug, projectId, pageId);
+  };
+
   /**
    * @description create a page
    * @param {Partial<TPage>} pageData
@@ -306,7 +380,13 @@ export class ProjectPageStore implements IProjectPageStore {
 
       const page = await this.service.create(workspaceSlug, projectId, pageData);
       runInAction(() => {
-        if (page?.id) set(this.data, [page.id], new ProjectPage(this.store, page));
+        if (page?.id) {
+          set(this.data, [page.id], new ProjectPage(this.store, {
+            ...page,
+            project_ids: page.project_ids?.length ? page.project_ids : [projectId],
+          }));
+          if (page.parent && this.nodeMap[page.parent]) this.nodeMap[page.parent].push(page.id);
+        }
         this.loader = undefined;
       });
 
@@ -327,15 +407,31 @@ export class ProjectPageStore implements IProjectPageStore {
    * @description delete a page
    * @param {string} pageId
    */
-  removePage = async ({ pageId, shouldSync: _shouldSync = true }: { pageId: string; shouldSync?: boolean }) => {
+  removePage = async ({ pageId, shouldSync = true }: { pageId: string; shouldSync?: boolean }) => {
     try {
       const { workspaceSlug, projectId } = this.store.router;
       if (!workspaceSlug || !projectId || !pageId) return undefined;
 
-      await this.service.remove(workspaceSlug, projectId, pageId);
+      if (shouldSync) await this.service.remove(workspaceSlug, projectId, pageId);
       runInAction(() => {
-        unset(this.data, [pageId]);
-        if (this.rootStore.favorite.entityMap[pageId]) this.rootStore.favorite.removeFavoriteFromStore(pageId);
+        const removedIds = new Set<string>();
+        const collect = (id: string) => {
+          if (removedIds.has(id)) return;
+          removedIds.add(id);
+          for (const childId of this.nodeMap[id] ?? []) collect(childId);
+        };
+        collect(pageId);
+        for (const id of removedIds) {
+          unset(this.data, [id]);
+          unset(this.nodeMap, [id]);
+          unset(this.childrenRequestGeneration, [id]);
+          if (this.rootStore.favorite.entityMap[id]) this.rootStore.favorite.removeFavoriteFromStore(id);
+        }
+        for (const ids of Object.values(this.nodeMap)) {
+          for (let index = ids.length - 1; index >= 0; index--) {
+            if (removedIds.has(ids[index])) ids.splice(index, 1);
+          }
+        }
       });
     } catch (error) {
       runInAction(() => {

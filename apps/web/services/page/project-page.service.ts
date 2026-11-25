@@ -21,8 +21,10 @@ export class ProjectPageService extends APIService {
     this.fileUploadService = new FileUploadService();
   }
 
-  async fetchAll(workspaceSlug: string, projectId: string): Promise<TPage[]> {
-    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/`)
+  async fetchAll(workspaceSlug: string, projectId: string, archived = false): Promise<TPage[]> {
+    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/`, {
+      params: archived ? { show_archived: "true" } : {},
+    })
       .then((response) => response?.data)
       .catch((error) => {
         throw error?.response?.data;
@@ -35,6 +37,22 @@ export class ProjectPageService extends APIService {
         track_visit: trackVisit,
       },
     })
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  async fetchChildren(workspaceSlug: string, projectId: string, pageId: string): Promise<TPage[]> {
+    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/${pageId}/children/`)
+      .then((response) => response?.data)
+      .catch((error) => {
+        throw error?.response?.data;
+      });
+  }
+
+  async fetchAncestors(workspaceSlug: string, projectId: string, pageId: string): Promise<TPage[]> {
+    return this.get(`/api/workspaces/${workspaceSlug}/projects/${projectId}/pages/${pageId}/ancestors/`)
       .then((response) => response?.data)
       .catch((error) => {
         throw error?.response?.data;

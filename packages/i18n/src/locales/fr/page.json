@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "Limite de contenu atteinte et la synchronisation en direct est désactivée. Créez une nouvelle page ou utilisez des pages imbriquées pour continuer la synchronisation."
+  },
+  "nested_pages": {
+    "create_error": "Could not create subpage.",
+    "collapse": "Collapse {title}",
+    "expand": "Expand {title}",
+    "create_child": "Create subpage of {title}",
+    "loading": "Loading subpages…",
+    "load_error": "Could not load subpages.",
+    "retry": "Try again",
+    "empty": "No subpages",
+    "breadcrumb": "Page hierarchy",
+    "pages": "Pages"
   }
 }

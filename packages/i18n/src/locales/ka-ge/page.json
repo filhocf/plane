@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "კონტენტის ლიმიტი ამოწურულია და რეალურ დროში სინქრონიზაცია გამორთულია. შექმენით ახალი გვერდი ან გამოიყენეთ ჩალაგებული გვერდები სინქრონიზაციის გასაგრძელებლად."
+  },
+  "nested_pages": {
+    "create_error": "Could not create subpage.",
+    "collapse": "Collapse {title}",
+    "expand": "Expand {title}",
+    "create_child": "Create subpage of {title}",
+    "loading": "Loading subpages…",
+    "load_error": "Could not load subpages.",
+    "retry": "Try again",
+    "empty": "No subpages",
+    "breadcrumb": "Page hierarchy",
+    "pages": "Pages"
   }
 }

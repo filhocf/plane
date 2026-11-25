@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "Limite de conteúdo atingido e a sincronização em tempo real está desativada. Crie uma nova página ou use páginas aninhadas para continuar sincronizando."
+  },
+  "nested_pages": {
+    "create_error": "Não foi possível criar subpágina.",
+    "collapse": "Recolher {title}",
+    "expand": "Expandir {title}",
+    "create_child": "Criar subpágina de {title}",
+    "loading": "Carregando subpáginas…",
+    "load_error": "Não foi possível carregar subpáginas.",
+    "retry": "Tentar novamente",
+    "empty": "Nenhuma subpágina",
+    "breadcrumb": "Hierarquia da página",
+    "pages": "Páginas"
   }
 }

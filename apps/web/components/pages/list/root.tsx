@@ -29,10 +29,12 @@ export const PagesListRoot = observer(function PagesListRoot(props: TPagesListRo
 
   if (!filteredPageIds) return <></>;
   return (
-    <ListLayout>
-      {filteredPageIds.map((pageId) => (
-        <PageListBlock key={pageId} pageId={pageId} storeType={storeType} />
-      ))}
-    </ListLayout>
+    <div role="tree">
+      <ListLayout>
+        {filteredPageIds.map((pageId) => (
+          <PageListBlock key={pageId} pageId={pageId} storeType={storeType} treeEnabled={pageType !== "archived"} />
+        ))}
+      </ListLayout>
+    </div>
   );
 });

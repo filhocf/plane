@@ -124,5 +124,17 @@
   },
   "page_content_limit_banner": {
     "message": "Досягнуто ліміту вмісту, і живу синхронізацію вимкнено. Створіть нову сторінку або використайте вкладені сторінки, щоб продовжити синхронізацію."
+  },
+  "nested_pages": {
+    "create_error": "Could not create subpage.",
+    "collapse": "Collapse {title}",
+    "expand": "Expand {title}",
+    "create_child": "Create subpage of {title}",
+    "loading": "Loading subpages…",
+    "load_error": "Could not load subpages.",
+    "retry": "Try again",
+    "empty": "No subpages",
+    "breadcrumb": "Page hierarchy",
+    "pages": "Pages"
   }
 }
